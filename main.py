@@ -1,3 +1,5 @@
+"""Умный ассистент с характером — CLI чат-бот на LangChain."""
+
 import argparse
 from enum import Enum
 
@@ -13,11 +15,16 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_MODEL = "openrouter/free"
+FALLBACK_MODEL = "google/gemma-3-4b-it:free"
+
 
 # ── Часть 1: Pydantic-модели ──
 
 
 class RequestType(str, Enum):
+    """Перечисление типов пользовательских запросов."""
     QUESTION = "question"
     TASK = "task"
     SMALL_TALK = "small_talk"
@@ -26,12 +33,14 @@ class RequestType(str, Enum):
 
 
 class Classification(BaseModel):
+    """Результат классификации запроса."""
     request_type: RequestType = Field(description="Тип запроса")
     confidence: float = Field(ge=0, le=1, description="Уверенность классификации")
     reasoning: str = Field(description="Краткое обоснование")
 
 
 class AssistantResponse(BaseModel):
+    """Итоговый ответ бота с метаданными."""
     content: str
     request_type: RequestType
     confidence: float
@@ -86,6 +95,7 @@ CLASSIFICATION_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def build_classifier(model):
+    """LCEL-цепочка: вход → промпт → модель → PydanticOutputParser → Classification."""
     parser = PydanticOutputParser(pydantic_object=Classification)
     chain = (
         {"query": RunnablePassthrough(), "format_instructions": lambda _: parser.get_format_instructions()}
@@ -128,6 +138,8 @@ def build_handlers(model, character: str):
 
 
 class MemoryManager:
+    """Хранит историю диалога. Стратегии: buffer (последние N) и summary (суммаризация старых)."""
+
     def __init__(self, strategy: str = "buffer", model=None, max_messages: int = 20):
         self.strategy = strategy
         self.model = model
@@ -170,16 +182,25 @@ class MemoryManager:
         return len(self.messages)
 
 
-# ── Часть 6: CLI ──
+# ── Модель с fallback ──
+
+
+def build_model(model_name: str):
+    """Основная модель + fallback на запасную через .with_fallbacks()."""
+    main_model = ChatOpenAI(model=model_name, temperature=0.7, base_url=OPENROUTER_BASE_URL)
+    fallback_model = ChatOpenAI(model=FALLBACK_MODEL, temperature=0.7, base_url=OPENROUTER_BASE_URL)
+    return main_model.with_fallbacks([fallback_model])
+
+
+# ── Часть 6: CLI + стриминг ──
 
 
 class SmartAssistant:
-    def __init__(self, model_name: str = "openrouter/free", character: str = "friendly", memory_strategy: str = "buffer"):
-        self.model = ChatOpenAI(
-            model=model_name,
-            temperature=0.7,
-            base_url="https://openrouter.ai/api/v1",
-        )
+    """Классификация → роутинг → ответ (с памятью и характером)."""
+
+    def __init__(self, model_name: str = DEFAULT_MODEL, character: str = "friendly", memory_strategy: str = "buffer"):
+        self.model_name = model_name
+        self.model = build_model(model_name)
         self.character = character
         self.memory = MemoryManager(strategy=memory_strategy, model=self.model)
         self.classify = build_classifier(self.model)
@@ -197,27 +218,38 @@ class SmartAssistant:
         handler = self.handlers[classification.request_type]
         response_text = handler.invoke({"query": user_input, "history": self.memory.get_history()})
         self.memory.add(user_input, response_text)
-        tokens_approx = len(response_text) // 4
         return AssistantResponse(
             content=response_text,
             request_type=classification.request_type,
             confidence=classification.confidence,
-            tokens_used=tokens_approx,
+            tokens_used=len(response_text) // 4,
         )
+
+    def process_stream(self, user_input: str):
+        classification = self.classify(user_input)
+        handler = self.handlers[classification.request_type]
+        print(f"[{classification.request_type.value}] ", end="", flush=True)
+        chunks = []
+        for chunk in handler.stream({"query": user_input, "history": self.memory.get_history()}):
+            print(chunk, end="", flush=True)
+            chunks.append(chunk)
+        response_text = "".join(chunks)
+        self.memory.add(user_input, response_text)
+        print(f"\nconfidence: {classification.confidence:.2f} | tokens: ~{len(response_text) // 4}\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Умный ассистент с характером")
     parser.add_argument("--character", default="friendly", choices=CHARACTER_PROMPTS.keys())
     parser.add_argument("--memory", default="buffer", choices=["buffer", "summary"])
-    parser.add_argument("--model", default="openrouter/free")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--no-stream", action="store_true")
     args = parser.parse_args()
 
     set_llm_cache(InMemoryCache())
-
     assistant = SmartAssistant(model_name=args.model, character=args.character, memory_strategy=args.memory)
 
-    print(f"🤖 Умный ассистент с характером")
+    print("🤖 Умный ассистент с характером")
     print(f"Характер: {assistant.character} | Память: {assistant.memory.strategy}")
     print("─" * 40)
     print("Введите /help для справки\n")
@@ -259,7 +291,7 @@ def main():
             elif cmd == "/status":
                 print(f"Характер: {assistant.character}")
                 print(f"Память: {assistant.memory.strategy} ({assistant.memory.count} сообщений)")
-                print(f"Модель: {assistant.model.model}")
+                print(f"Модель: {assistant.model_name}")
             elif cmd == "/help":
                 print("/clear            — очистить историю")
                 print("/character <name> — сменить характер (friendly, professional, sarcastic, pirate)")
@@ -268,13 +300,15 @@ def main():
                 print("/help             — эта справка")
                 print("/quit             — выход")
             else:
-                print(f"✗ Неизвестная команда. Введите /help")
+                print("✗ Неизвестная команда. Введите /help")
             continue
 
-        result = assistant.process(user_input)
-        print(f"[{result.request_type.value}] {result.content}")
-        print(f"confidence: {result.confidence:.2f} | tokens: ~{result.tokens_used}")
-        print()
+        if args.no_stream:
+            result = assistant.process(user_input)
+            print(f"[{result.request_type.value}] {result.content}")
+            print(f"confidence: {result.confidence:.2f} | tokens: ~{result.tokens_used}\n")
+        else:
+            assistant.process_stream(user_input)
 
 
 if __name__ == "__main__":
